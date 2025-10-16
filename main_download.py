@@ -16,8 +16,15 @@ Options :
 - --env          : practice|live (override du .env)
 """
 
+# --- PATH SAFETY HEADER ---
 from __future__ import annotations
-import os
+import sys, pathlib
+
+ROOT = pathlib.Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+# -----------------------------------------------------------
+
 import argparse
 from datetime import datetime, timedelta
 import pandas as pd
