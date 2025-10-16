@@ -1,3 +1,19 @@
+# indicators/ema.py
+# -*- coding: utf-8 -*-
+"""
+Indicateurs techniques de base (purs, sans dépendances projet) :
+
+Notes :
+- Tous les indicateurs retournent un pd.Series aligné à l'index d'entrée.
+- Validation défensive : longueurs >= 1, types numériques, etc.
+- min_periods = window (par défaut) => NaN jusqu’à disposer d’assez d’historique.
+"""
+
+from __future__ import annotations
+from typing import Optional
+import pandas as pd
+import numpy as np
+
 def ema(close, length: int = 200, adjust: bool = False) -> pd.Series:
     """
     EMA (Exponential Moving Average) de 'close'.
