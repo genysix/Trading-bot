@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==================================================
-# update_deps.sh — Upgrade de TOUTES les dépendances
-# Usage : ./update_deps.sh
+# upgrade_deps.sh — Upgrade de TOUTES les dépendances
+# Usage : ./upgrade_deps.sh
 # --------------------------------------------------
 set -euo pipefail
 
