@@ -12,7 +12,7 @@ __pycache__/
 *.tmp
 
 # Configurations locales
-.env
+
 .DS_Store
 
 # Les scripts GitHub
