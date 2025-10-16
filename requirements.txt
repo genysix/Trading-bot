@@ -1,0 +1,11 @@
+# Core data & compute
+pandas==2.3.3
+numpy==2.3.4
+pyarrow==21.0.0
+
+# HTTP & env
+requests==2.32.5
+python-dotenv==1.1.1
+
+# --- Optional (OANDA official wrapper; we use requests directly) ---
+oandapyV20==0.7.2

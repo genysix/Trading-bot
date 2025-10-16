@@ -1,18 +1,23 @@
-# Environnements virtuels
+# Environnements / secrets
 .venv/
 __pycache__/
 *.pyc
+.env
 
-# Données locales
-/data/*.csv
-/data/*.parquet
+# Artefacts
+*.parquet
+*.pq
+*.csv
+*.log
+
+# Répertoires de données
+data_local/
 
 # Fichiers de logs ou temporaires
 *.log
 *.tmp
 
 # Configurations locales
-.env
 .DS_Store
 
 # Les scripts GitHub

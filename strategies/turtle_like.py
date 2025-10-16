@@ -1,28 +1,31 @@
 # strategies/turtle_like.py
 # -*- coding: utf-8 -*-
 """
-Stratégie Turtle-like (breakout + stops basés volatilité), version squelette.
-- Paramètres par défaut inclus ICI (propres à la stratégie).
-- Validation défensive des hyperparamètres.
-- Implémente la logique de sortie F6 : Trailing ATR et Donchian inverse (activables séparément).
-- Les entrées (breakouts) / sizing / pyramiding seront ajoutés à l’étape suivante, pour valider le squelette file-by-file.
+Stratégie Turtle-like complète (v1)
+- Entrées : breakouts Donchian (X) avec filtre EMA (optionnel)
+- Sorties : Trailing ATR + Donchian inverse (logique OR)
+- Sizing : risque % du capital / (ATR * STOP_K * VALUE_PER_POINT)
+- Pyramiding : ajout d'unités tous les PYRAMID_STEP_ATR * ATR (jusqu'à PYRAMID_UNITS)
+- Indicateurs : via indicators/core.py
 
 Conventions d'I/O :
-- La stratégie est agnostique des sources de données.
-- Le moteur de backtest doit appeler `on_bar(bar)` séquentiellement avec des barres ordonnées.
-- Une "barre" est un dict (ou objet) avec au minimum : {"time", "open", "high", "low", "close", "volume"}.
-- Les indicateurs sont calculés à partir d'un tampon interne de barres (self._bars).
+- Moteur de backtest appelle .on_bar(bar) (bar: dict "time","open","high","low","close","volume?")
+- La stratégie retourne { "action":"ENTER"/"EXIT", "side":"LONG/SHORT", "qty":float, ... } ou None
+- Le moteur exécute au close ou next open (selon EngineConfig), applique slippage/commission.
+
+Avertissement :
+- Code pour expérimentation. Le trading réel comporte des risques importants.
 """
+
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import Optional, Literal, Dict, Any, List
+from dataclasses import dataclass
+from typing import Optional, Literal, Dict, Any, List, Tuple
 import math
 
-try:
-    import pandas as pd
-    import numpy as np
-except Exception as e:
-    raise ImportError("Ce module nécessite pandas et numpy. Installe: pip install pandas numpy") from e
+import pandas as pd
+import numpy as np
+
+from indicators.core import atr as ind_atr, donchian_high, donchian_low, ema as ind_ema
 
 
 PositionSide = Literal["FLAT", "LONG", "SHORT"]
@@ -30,304 +33,432 @@ PositionSide = Literal["FLAT", "LONG", "SHORT"]
 
 @dataclass
 class TurtleParams:
-    # --- PARAMÈTRES GÉNÉRAUX ---
+    # ====== PARAMÈTRES GÉNÉRAUX ======
 
-    # Risque par trade (en fraction du capital). Valeurs possibles : float > 0.
-    # Conseillé en réel: 0.005 à 0.02 (0.5% à 2%). Pour test: tu as choisi 0.05 (5%) possible mais agressif.
+    # Risque par trade (fraction du capital). Valeurs possibles : float > 0.
+    # Conseils pratique en réel : 0.005–0.02 (0.5%–2%). Pour tests agressifs : 0.05 (5%) possible.
     RISK_PER_TRADE: float = 0.05
 
-    # Effet de levier maximal à ne pas dépasser (contrainte logique côté exécution/backtest).
-    # Valeurs possibles : float >= 1.0 (ex: 1.0 à 5.0). Tu as demandé par défaut 2.0.
+    # Capital de base utilisé par le sizing (si l’engine ne pousse pas l’equity courante).
+    # Valeurs possibles : float > 0. Ex : 1000.0
+    BASE_CAPITAL: float = 1000.0
+
+    # Effet de levier maximal logique (contrainte côté stratégie). Valeurs : float >= 1.0
     MAX_LEVERAGE: float = 2.0
 
-    # Timeframe utilisé par cette instance (indicatif). Chaîne libre; la granularité réelle vient des données.
-    # Valeurs possibles : "M1","M5","M15","H1","H4","D1","W1".
+    # Autoriser les positions SHORT. Valeurs : bool
+    ALLOW_SHORT: bool = True
+
+    # Timeframe indicatif (pour logs/rapports). Valeurs : "M1","M5","M15","H1","H4","D1","W1"
     TIMEFRAME: str = "D1"
 
-    # --- INDICATEURS ---
+    # Valeur monétaire par 1.0 de mouvement de prix *par unité de qty*.
+    # Exemple conceptuel : si 1.0 de mouvement vaut 1 $ par unité, VALUE_PER_POINT = 1.0.
+    # Adapte selon instrument (CFD, lot, contrat). Valeurs : float > 0.
+    VALUE_PER_POINT: float = 1.0
 
-    # Longueur de l'ATR (Average True Range). Entier >= 1. Classique: 14, 20, 30.
+    # Quantité minimale et maximale par ordre (garde-fous). Valeurs : float > 0, min <= max.
+    MIN_QTY: float = 0.001
+    MAX_QTY: float = 1e9  # tu ajusteras selon courtier/instrument
+
+    # ====== INDICATEURS / TENDANCE ======
+
+    # Longueur ATR (entier >= 1). Classiques : 14, 20, 30.
     ATR_LEN: int = 20
 
-    # Longueur de la moyenne mobile exponentielle (filtre de tendance).
-    # Entier >= 1. Classique: 100, 200, 300. Peut être ignorée si USE_TREND_FILTER=False
+    # Longueur EMA pour filtre de tendance (entier >= 1). Ex : 100, 200, 300.
     EMA_TREND_LEN: int = 200
 
-    # Activer le filtre de tendance EMA200 (True/False).
-    # Si True : on considérera plus tard d’autoriser LONG seulement si close > EMA et SHORT si close < EMA.
+    # Activer filtre tendance EMA (True/False).
+    # Si True : LONG seulement si close > EMA ; SHORT seulement si close < EMA.
     USE_TREND_FILTER: bool = True
 
-    # --- SORTIES (F6) ---
+    # ====== ENTRÉES BREAKOUT DONCHIAN ======
 
-    # Activer le Trailing Stop basé sur l’ATR (True/False).
+    # Fenêtre Donchian d'entrée (entier >= 2). Classiques : 20, 55.
+    DONCHIAN_ENTRY_X: int = 20
+
+    # Confirmer les entrées uniquement sur clôture au-dessus/au-dessous du canal ? (True/False)
+    # True = confirme à la clôture ; False = signal intrabar (plus agressif).
+    CONFIRM_ON_CLOSE: bool = True
+
+    # ====== STOPS & SORTIES ======
+
+    # Stop initial = STOP_K * ATR (float > 0). Ex : 1.0–2.0. Plus grand = stop plus large.
+    STOP_K: float = 1.0
+
+    # Activer le Trailing ATR (True/False). Si True, stop suiveur à TRAIL_K * ATR.
     USE_TRAIL_ATR: bool = True
 
-    # Multiple du Trailing Stop ATR. Float > 0. Plus grand = stop plus large (plus patient).
-    # Exemples raisonnables: 1.5, 2.0, 2.5, 3.0
+    # Multiple du Trailing Stop ATR. Float > 0. Ex : 1.5, 2.0, 2.5, 3.0
     TRAIL_K: float = 2.5
 
-    # Activer la sortie par canal Donchian inverse (True/False).
+    # Activer la sortie Donchian inverse (True/False). Si True : sortie quand close casse le canal opposé (Y).
     USE_DONCHIAN_EXIT: bool = True
 
-    # Fenêtre Donchian pour la sortie inverse. Entier >= 2 (ex: 10, 20).
+    # Fenêtre Donchian de sortie inverse (entier >= 2). Souvent 10–20 (peut différer de X).
     DONCHIAN_EXIT_Y: int = 20
 
-    # --- EXÉCUTION / COÛTS (simples placeholders, affinés côté moteur) ---
+    # ====== PYRAMIDING ======
 
-    # Modèle de slippage "per_tick" = valeur moyenne (ticks/points) ajoutée au prix de fill.
-    # Peut être modélisé en moteur. Ici, on conserve la valeur comme référence.
+    # Nombre d’ajouts (unités supplémentaires) au maximum après l’entrée initiale. Entier >= 0.
+    # Ex : 0 (désactivé), 1–4 (classique Turtle).
+    PYRAMID_UNITS: int = 0
+
+    # Pas d’ajout en ATR : à chaque mouvement favorable de (PYRAMID_STEP_ATR * ATR), on ajoute 1 unité.
+    # Valeurs : float > 0. Ex : 0.5, 1.0.
+    PYRAMID_STEP_ATR: float = 0.5
+
+    # ====== COÛTS (placeholders) ======
+
+    # Slippage moyen par trade (en unités de prix). Ici utilisé seulement comme info/trace possible.
     SLIPPAGE_PER_TICK: float = 0.5
 
-    # Commission fixe par trade (placeholder; traité côté moteur).
+    # Commission fixe par trade (info/trace — l’engine la gère réellement).
     COMMISSION_PER_TRADE: float = 0.0
 
-    # --- CONTRÔLES / SÉCURITÉ ---
+    # ====== CONTRÔLE ======
 
-    # Si True, on lève ValueError en cas de paramètre incohérent. Si False, on clamp/ajuste silencieusement.
+    # Validation stricte : si True, on lève en cas d’incohérence ; sinon on corrige au mieux.
     STRICT_VALIDATION: bool = True
 
     def validate(self) -> None:
-        """Valide/coerce les paramètres pour éviter de tout faire planter en cas de test incohérent."""
+        """Validation/coercition défensive des paramètres."""
         def _err(msg: str):
             if self.STRICT_VALIDATION:
                 raise ValueError(msg)
 
-        # RISK_PER_TRADE
-        if not (isinstance(self.RISK_PER_TRADE, (int, float)) and self.RISK_PER_TRADE > 0):
-            _err("RISK_PER_TRADE doit être un float > 0.")
-            self.RISK_PER_TRADE = max(0.0001, float(self.RISK_PER_TRADE) if isinstance(self.RISK_PER_TRADE, (int,float)) else 0.01)
+        for name in ("RISK_PER_TRADE","BASE_CAPITAL","MAX_LEVERAGE","VALUE_PER_POINT",
+                     "MIN_QTY","MAX_QTY","STOP_K","TRAIL_K","SLIPPAGE_PER_TICK","COMMISSION_PER_TRADE"):
+            val = getattr(self, name)
+            if not isinstance(val, (int, float)):
+                _err(f"{name} doit être numérique.")
+                continue
+            if name in ("RISK_PER_TRADE","BASE_CAPITAL","VALUE_PER_POINT","MIN_QTY","STOP_K","TRAIL_K"):
+                if val <= 0: _err(f"{name} doit être > 0.")
+            if name == "MAX_LEVERAGE" and val < 1.0:
+                _err("MAX_LEVERAGE doit être >= 1.0")
+            if name == "SLIPPAGE_PER_TICK" and val < 0:
+                _err("SLIPPAGE_PER_TICK doit être >= 0.")
+            if name == "COMMISSION_PER_TRADE" and val < 0:
+                _err("COMMISSION_PER_TRADE doit être >= 0.")
 
-        # MAX_LEVERAGE
-        if not (isinstance(self.MAX_LEVERAGE, (int, float)) and self.MAX_LEVERAGE >= 1.0):
-            _err("MAX_LEVERAGE doit être >= 1.0")
-            self.MAX_LEVERAGE = max(1.0, float(self.MAX_LEVERAGE) if isinstance(self.MAX_LEVERAGE, (int,float)) else 1.0)
+        for name in ("ATR_LEN","EMA_TREND_LEN","DONCHIAN_ENTRY_X","DONCHIAN_EXIT_Y","PYRAMID_UNITS"):
+            val = getattr(self, name)
+            if not isinstance(val, int) or val < (2 if "DONCHIAN" in name else 1):
+                _err(f"{name} doit être un entier valide (>=2 pour Donchian, sinon >=1).")
 
-        # ATR_LEN
-        if not (isinstance(self.ATR_LEN, int) and self.ATR_LEN >= 1):
-            _err("ATR_LEN doit être un entier >= 1.")
-            self.ATR_LEN = int(max(1, int(self.ATR_LEN) if isinstance(self.ATR_LEN, (int,)) else 20))
+        if self.MIN_QTY > self.MAX_QTY:
+            _err("MIN_QTY ne doit pas être > MAX_QTY")
 
-        # EMA_TREND_LEN
-        if not (isinstance(self.EMA_TREND_LEN, int) and self.EMA_TREND_LEN >= 1):
-            _err("EMA_TREND_LEN doit être un entier >= 1.")
-            self.EMA_TREND_LEN = int(max(1, int(self.EMA_TREND_LEN) if isinstance(self.EMA_TREND_LEN, (int,)) else 200))
-
-        # TRAIL_K
-        if not (isinstance(self.TRAIL_K, (int, float)) and self.TRAIL_K > 0):
-            _err("TRAIL_K doit être un float > 0.")
-            self.TRAIL_K = float(self.TRAIL_K) if isinstance(self.TRAIL_K, (int,float)) and self.TRAIL_K > 0 else 2.5
-
-        # DONCHIAN_EXIT_Y
-        if not (isinstance(self.DONCHIAN_EXIT_Y, int) and self.DONCHIAN_EXIT_Y >= 2):
-            _err("DONCHIAN_EXIT_Y doit être un entier >= 2.")
-            self.DONCHIAN_EXIT_Y = int(max(2, int(self.DONCHIAN_EXIT_Y) if isinstance(self.DONCHIAN_EXIT_Y, (int,)) else 20))
-
-        # SLIPPAGE_PER_TICK
-        if not (isinstance(self.SLIPPAGE_PER_TICK, (int, float)) and self.SLIPPAGE_PER_TICK >= 0):
-            _err("SLIPPAGE_PER_TICK doit être un float >= 0.")
-            self.SLIPPAGE_PER_TICK = float(self.SLIPPAGE_PER_TICK) if isinstance(self.SLIPPAGE_PER_TICK, (int,float)) and self.SLIPPAGE_PER_TICK >= 0 else 0.5
-
-        # COMMISSION_PER_TRADE
-        if not (isinstance(self.COMMISSION_PER_TRADE, (int, float)) and self.COMMISSION_PER_TRADE >= 0):
-            _err("COMMISSION_PER_TRADE doit être un float >= 0.")
-            self.COMMISSION_PER_TRADE = float(self.COMMISSION_PER_TRADE) if isinstance(self.COMMISSION_PER_TRADE, (int,float)) and self.COMMISSION_PER_TRADE >= 0 else 0.0
+        if not isinstance(self.USE_TREND_FILTER, bool): _err("USE_TREND_FILTER doit être bool.")
+        if not isinstance(self.USE_TRAIL_ATR, bool):    _err("USE_TRAIL_ATR doit être bool.")
+        if not isinstance(self.USE_DONCHIAN_EXIT, bool): _err("USE_DONCHIAN_EXIT doit être bool.")
+        if not isinstance(self.ALLOW_SHORT, bool):       _err("ALLOW_SHORT doit être bool.")
+        if not isinstance(self.CONFIRM_ON_CLOSE, bool):  _err("CONFIRM_ON_CLOSE doit être bool.")
 
 
 class TurtleLikeStrategy:
     """
-    Implémentation squelette Turtle-like.
-    - Gère un tampon de barres (pandas DataFrame) pour calculer ATR / EMA / Donchian.
-    - État interne : position, prix d'entrée, stop, etc.
-    - Pour l’instant : logique de SORTIE (Trailing ATR + Donchian inverse) + hooks pour ENTRÉE à venir.
+    Stratégie Turtle-like v1
+    - Calcule ATR/EMA/Donchian via indicators.core
+    - Gère entrées, sizing, stops, pyramiding et sorties (F6)
     """
 
     def __init__(self, params: Optional[TurtleParams] = None):
         self.params = params or TurtleParams()
         self.params.validate()
 
+        # Tampon historique
         self._bars: List[Dict[str, Any]] = []
-        self._df: Optional[pd.DataFrame] = None  # data consolidée pour indicateurs
+        self._df: Optional[pd.DataFrame] = None
 
         # État de position
         self.position: PositionSide = "FLAT"
         self.entry_price: Optional[float] = None
         self.stop_price: Optional[float] = None
+        self.qty: float = 0.0
 
-        # Placeholders pour métriques simples
+        # Pyramiding
+        self.added_units: int = 0
+        self.next_add_price: Optional[float] = None  # prix seuil pour prochain ajout
+
+        # Reporting
         self.closed_trades: List[Dict[str, Any]] = []
 
-    # -------------------------
-    # API publique minimaliste
-    # -------------------------
+    # -----------------------
+    # API publique
+    # -----------------------
 
     def on_bar(self, bar: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        Appelé séquentiellement par le moteur de backtest pour chaque nouvelle barre.
-        Renvoie éventuellement un ordre simulé sous forme d’un dict (ex: {"action":"EXIT","price":...})
-        ou None s'il n'y a rien à exécuter sur cette barre.
-        """
         self._append_bar(bar)
-        if self._df is None or len(self._df) < max(self.params.ATR_LEN, self.params.DONCHIAN_EXIT_Y) + 2:
-            return None  # pas assez d'historique pour indicateurs/stops
+        if self._df is None or len(self._df) < max(self.params.ATR_LEN,
+                                                   self.params.DONCHIAN_ENTRY_X,
+                                                   self.params.DONCHIAN_EXIT_Y) + 2:
+            return None
 
-        # 1) Mettre à jour indicateurs
         self._compute_indicators()
 
-        # 2) Gérer sorties si position ouverte
-        exit_order = self._maybe_exit(bar)
+        # 1) Sorties (si position ouverte) — logique OR (ATR trail OU Donchian inverse)
+        exit_order = self._maybe_exit()
         if exit_order is not None:
             return exit_order
 
-        # 3) (Prochain commit) Générer signaux d'ENTRÉE (breakouts / filtre EMA / sizing)
-        #    Pour l’instant, on ne traite que les sorties comme convenu.
+        # 2) Pyramiding (si position ouverte et autorisé)
+        add_order = self._maybe_pyramid()
+        if add_order is not None:
+            return add_order
+
+        # 3) Entrées (si FLAT)
+        if self.position == "FLAT":
+            enter_order = self._maybe_enter()
+            if enter_order is not None:
+                return enter_order
+
         return None
 
-    # -------------------------
-    # Indicateurs & utils
-    # -------------------------
+    # -----------------------
+    # Indicateurs & DF
+    # -----------------------
 
     def _append_bar(self, bar: Dict[str, Any]) -> None:
-        # Validation sommaire de la barre
-        for key in ("time", "open", "high", "low", "close"):
-            if key not in bar:
-                raise KeyError(f"Bar manquante clé obligatoire: {key}")
+        for k in ("time","open","high","low","close"):
+            if k not in bar:
+                raise KeyError(f"Bar manquante clé obligatoire : {k}")
         self._bars.append(bar)
-        # mettra à jour _df au besoin
-        self._df = None  # lazy rebuild
+        self._df = None  # recalcul lazy
 
     def _compute_indicators(self) -> None:
-        # Construit un DataFrame une seule fois par on_bar (lazy)
-        if self._df is None:
-            self._df = pd.DataFrame(self._bars)
-            # Assure colonnes
-            for col in ("open", "high", "low", "close"):
-                self._df[col] = pd.to_numeric(self._df[col], errors="coerce")
-            # ATR
-            self._df["tr"] = self._true_range(self._df["high"], self._df["low"], self._df["close"])
-            self._df["atr"] = self._df["tr"].rolling(window=self.params.ATR_LEN, min_periods=self.params.ATR_LEN).mean()
+        if self._df is not None:
+            return
+        df = pd.DataFrame(self._bars)
+        for c in ("open","high","low","close"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
-            # EMA pour filtre tendance
-            if self.params.USE_TREND_FILTER:
-                self._df["ema_trend"] = self._df["close"].ewm(span=self.params.EMA_TREND_LEN, adjust=False).mean()
+        # ATR
+        df["atr"] = ind_atr(df["high"], df["low"], df["close"], window=self.params.ATR_LEN)
+
+        # EMA filtre tendance
+        if self.params.USE_TREND_FILTER:
+            df["ema_trend"] = ind_ema(df["close"], length=self.params.EMA_TREND_LEN)
+        else:
+            df["ema_trend"] = np.nan
+
+        # Donchian entrée/sortie
+        X = self.params.DONCHIAN_ENTRY_X
+        Y = self.params.DONCHIAN_EXIT_Y
+        df[f"donch_high_{X}"] = donchian_high(df["high"], window=X)
+        df[f"donch_low_{X}"]  = donchian_low(df["low"], window=X)
+        df[f"donch_high_{Y}"] = donchian_high(df["high"], window=Y)
+        df[f"donch_low_{Y}"]  = donchian_low(df["low"], window=Y)
+
+        self._df = df
+
+    # -----------------------
+    # Entrées
+    # -----------------------
+
+    def _maybe_enter(self) -> Optional[Dict[str, Any]]:
+        last = self._df.iloc[-1]
+        prev = self._df.iloc[-2]  # pour confirmer sur clôture précédente si besoin
+
+        close = float(last["close"])
+        atr = float(last["atr"]) if not math.isnan(last["atr"]) else None
+        if atr is None or atr <= 0:
+            return None
+
+        X = self.params.DONCHIAN_ENTRY_X
+        dhX = float(last[f"donch_high_{X}"]) if not math.isnan(last[f"donch_high_{X}"]) else None
+        dlX = float(last[f"donch_low_{X}"])  if not math.isnan(last[f"donch_low_{X}"])  else None
+
+        ema_ok_long = True
+        ema_ok_short = True
+        if self.params.USE_TREND_FILTER:
+            ema = float(last["ema_trend"]) if not math.isnan(last["ema_trend"]) else None
+            if ema is None:
+                return None
+            ema_ok_long  = close > ema
+            ema_ok_short = close < ema
+
+        # Détection du signal : au close (confirmé) ou intrabar
+        def breakout_long() -> bool:
+            if dhX is None: return False
+            if self.params.CONFIRM_ON_CLOSE:
+                # On exige que la (bar - 1) ait clôturé > dhX_prev (plus strict). Simpli : on check current close > dhX
+                return close > dhX
             else:
-                self._df["ema_trend"] = np.nan
+                # Intrabar : on pourrait utiliser le high courant ; ici on reste au close pour simplicité stable
+                return close > dhX
 
-            # Donchian pour sortie inverse
-            y = self.params.DONCHIAN_EXIT_Y
-            self._df["donch_low_y"] = self._df["low"].rolling(window=y, min_periods=y).min()
-            self._df["donch_high_y"] = self._df["high"].rolling(window=y, min_periods=y).max()
+        def breakout_short() -> bool:
+            if dlX is None: return False
+            if self.params.CONFIRM_ON_CLOSE:
+                return close < dlX
+            else:
+                return close < dlX
 
-    @staticmethod
-    def _true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
-        prev_close = close.shift(1)
-        tr1 = high - low
-        tr2 = (high - prev_close).abs()
-        tr3 = (low - prev_close).abs()
-        return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        # Essai LONG
+        if ema_ok_long and breakout_long():
+            qty, stop_init = self._compute_qty_and_stop(side="LONG", entry_price=close, atr=atr)
+            if qty <= 0:
+                return None
+            self._enter_position("LONG", entry_price=close, qty=qty, atr=atr, stop_init=stop_init)
+            return {"action":"ENTER","side":"LONG","qty":qty,"price":close,"time":self._df.iloc[-1]["time"]}
 
-    # -------------------------
-    # Sorties (F6)
-    # -------------------------
+        # Essai SHORT
+        if self.params.ALLOW_SHORT and ema_ok_short and breakout_short():
+            qty, stop_init = self._compute_qty_and_stop(side="SHORT", entry_price=close, atr=atr)
+            if qty <= 0:
+                return None
+            self._enter_position("SHORT", entry_price=close, qty=qty, atr=atr, stop_init=stop_init)
+            return {"action":"ENTER","side":"SHORT","qty":qty,"price":close,"time":self._df.iloc[-1]["time"]}
 
-    def _maybe_exit(self, bar: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        return None
+
+    def _compute_qty_and_stop(self, *, side: PositionSide, entry_price: float, atr: float) -> Tuple[float, float]:
         """
-        Applique la logique de sortie :
-        - Trailing stop ATR (optionnel)
-        - Donchian inverse (optionnel)
-        Logique OR : si l'une déclenche, on sort.
+        Taille = (capital * RISK%) / (STOP_K * ATR * VALUE_PER_POINT)
+        Stop initial :
+          LONG  : entry - STOP_K * ATR
+          SHORT : entry + STOP_K * ATR
         """
+        # capital courant approximé
+        capital = float(self.params.BASE_CAPITAL)
+
+        denom = max(1e-12, self.params.STOP_K * atr * self.params.VALUE_PER_POINT)
+        raw_qty = (capital * self.params.RISK_PER_TRADE) / denom
+
+        # bornes
+        qty = max(self.params.MIN_QTY, min(raw_qty, self.params.MAX_QTY))
+
+        if side == "LONG":
+            stop_init = entry_price - self.params.STOP_K * atr
+        else:
+            stop_init = entry_price + self.params.STOP_K * atr
+
+        return qty, stop_init
+
+    def _enter_position(self, side: PositionSide, *, entry_price: float, qty: float, atr: float, stop_init: float) -> None:
+        self.position = side
+        self.entry_price = float(entry_price)
+        self.qty = float(qty)
+
+        # Stop de travail (initial) ; pourra être relevé par trailing
+        self.stop_price = float(stop_init)
+
+        # Init pyramiding
+        self.added_units = 0
+        self.next_add_price = self._compute_next_add_price(side, entry_price, atr)
+
+    # -----------------------
+    # Pyramiding
+    # -----------------------
+
+    def _compute_next_add_price(self, side: PositionSide, ref_price: float, atr: float) -> Optional[float]:
+        if self.params.PYRAMID_UNITS <= 0:
+            return None
+        step = self.params.PYRAMID_STEP_ATR
+        if step <= 0 or atr <= 0:
+            return None
+        if side == "LONG":
+            return ref_price + step * atr
+        elif side == "SHORT":
+            return ref_price - step * atr
+        return None
+
+    def _maybe_pyramid(self) -> Optional[Dict[str, Any]]:
+        if self.position == "FLAT" or self.params.PYRAMID_UNITS <= 0:
+            return None
+
+        last = self._df.iloc[-1]
+        close = float(last["close"])
+        atr = float(last["atr"]) if not math.isnan(last["atr"]) else None
+        if atr is None or atr <= 0:
+            return None
+
+        if self.added_units >= self.params.PYRAMID_UNITS:
+            return None
+
+        if self.next_add_price is None:
+            return None
+
+        # Condition : prix a parcouru +step ATR (LONG) / -step ATR (SHORT) par rapport au dernier add
+        if self.position == "LONG" and close >= self.next_add_price:
+            # Ajout d'une unité de la même taille que l'initiale (simple). Option : fraction de l'initiale.
+            add_qty = self.qty  # même taille — ajuste si tu veux un escalier
+            self.added_units += 1
+            self.next_add_price = self._compute_next_add_price("LONG", self.next_add_price, atr)
+            return {"action":"ENTER","side":"LONG","qty":add_qty,"price":close,"time":last["time"],"reason":"PYRAMID"}
+
+        if self.position == "SHORT" and close <= self.next_add_price:
+            add_qty = self.qty
+            self.added_units += 1
+            self.next_add_price = self._compute_next_add_price("SHORT", self.next_add_price, atr)
+            return {"action":"ENTER","side":"SHORT","qty":add_qty,"price":close,"time":last["time"],"reason":"PYRAMID"}
+
+        return None
+
+    # -----------------------
+    # Sorties (Trailing ATR + Donchian inverse) — logique OR
+    # -----------------------
+
+    def _maybe_exit(self) -> Optional[Dict[str, Any]]:
         if self.position == "FLAT":
             return None
 
-        df = self._df
-        last = df.iloc[-1]
+        last = self._df.iloc[-1]
         close = float(last["close"])
         atr = float(last["atr"]) if not math.isnan(last["atr"]) else None
-
         if atr is None or atr <= 0:
-            return None  # pas d’ATR => pas de trailing cohérent
+            return None
 
         exit_by_atr = False
         exit_by_donch = False
 
-        if self.position == "LONG":
-            # Trailing ATR
-            if self.params.USE_TRAIL_ATR:
-                candidate_stop = close - self.params.TRAIL_K * atr
-                self.stop_price = max(self.stop_price or -np.inf, candidate_stop)
-                # sortie si close <= stop
+        # Trailing ATR
+        if self.params.USE_TRAIL_ATR:
+            if self.position == "LONG":
+                candidate = close - self.params.TRAIL_K * atr
+                self.stop_price = max(self.stop_price or -np.inf, candidate)
                 if close <= self.stop_price:
                     exit_by_atr = True
-
-            # Donchian inverse (clôture sous le plus bas Y)
-            if self.params.USE_DONCHIAN_EXIT:
-                donch_low = float(last["donch_low_y"]) if not math.isnan(last["donch_low_y"]) else None
-                if donch_low is not None and close < donch_low:
-                    exit_by_donch = True
-
-        elif self.position == "SHORT":
-            if self.params.USE_TRAIL_ATR:
-                candidate_stop = close + self.params.TRAIL_K * atr
-                self.stop_price = min(self.stop_price or np.inf, candidate_stop)
+            elif self.position == "SHORT":
+                candidate = close + self.params.TRAIL_K * atr
+                self.stop_price = min(self.stop_price or np.inf, candidate)
                 if close >= self.stop_price:
                     exit_by_atr = True
 
-            if self.params.USE_DONCHIAN_EXIT:
-                donch_high = float(last["donch_high_y"]) if not math.isnan(last["donch_high_y"]) else None
-                if donch_high is not None and close > donch_high:
+        # Donchian inverse (sur clôture)
+        if self.params.USE_DONCHIAN_EXIT:
+            Y = self.params.DONCHIAN_EXIT_Y
+            if self.position == "LONG":
+                dlow = float(last[f"donch_low_{Y}"]) if not math.isnan(last[f"donch_low_{Y}"]) else None
+                if dlow is not None and close < dlow:
+                    exit_by_donch = True
+            elif self.position == "SHORT":
+                dhigh = float(last[f"donch_high_{Y}"]) if not math.isnan(last[f"donch_high_{Y}"]) else None
+                if dhigh is not None and close > dhigh:
                     exit_by_donch = True
 
         if exit_by_atr or exit_by_donch:
-            # On retourne un ordre de sortie (le moteur décidera du prix: close, open next, etc.)
+            reason = "TRAIL_ATR" if exit_by_atr else "DONCHIAN_INVERSE"
             order = {
-                "action": "EXIT",
-                "reason": "TRAIL_ATR" if exit_by_atr else "DONCHIAN_INVERSE",
+                "action":"EXIT",
+                "reason": reason,
                 "position": self.position,
+                "qty": self.qty,
                 "stop_price": self.stop_price,
-                "close": close,
-                "time": bar.get("time")
+                "price": close,
+                "time": last["time"]
             }
-            # Reset état interne de position — le moteur confirmera réellement l’exécution
+            # Reset état
             self.position = "FLAT"
             self.entry_price = None
             self.stop_price = None
+            self.qty = 0.0
+            self.added_units = 0
+            self.next_add_price = None
             return order
 
         return None
-
-    # -------------------------
-    # Hooks entrée / gestion position (à compléter étape suivante)
-    # -------------------------
-
-    def maybe_enter_long(self, entry_price: float) -> Optional[Dict[str, Any]]:
-        """
-        Hook d’entrée LONG (à compléter à l’étape “entrées”).
-        Place aussi un stop initial basé ATR si USE_TRAIL_ATR.
-        """
-        if self.position != "FLAT":
-            return None
-        self.position = "LONG"
-        self.entry_price = float(entry_price)
-        self.stop_price = None
-        # Stop initial cohérent (optionnel)
-        if self.params.USE_TRAIL_ATR and self._df is not None:
-            atr = float(self._df.iloc[-1]["atr"])
-            if not math.isnan(atr) and atr > 0:
-                self.stop_price = self.entry_price - self.params.TRAIL_K * atr
-        return {"action": "ENTER", "side": "LONG", "price": self.entry_price}
-
-    def maybe_enter_short(self, entry_price: float) -> Optional[Dict[str, Any]]:
-        """
-        Hook d’entrée SHORT (à compléter à l’étape “entrées”).
-        """
-        if self.position != "FLAT":
-            return None
-        self.position = "SHORT"
-        self.entry_price = float(entry_price)
-        self.stop_price = None
-        if self.params.USE_TRAIL_ATR and self._df is not None:
-            atr = float(self._df.iloc[-1]["atr"])
-            if not math.isnan(atr) and atr > 0:
-                self.stop_price = self.entry_price + self.params.TRAIL_K * atr
-        return {"action": "ENTER", "side": "SHORT", "price": self.entry_price}
-# Fin du fichier strategies/turtle_like.py
+    
