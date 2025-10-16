@@ -109,7 +109,7 @@ Consultez le fichier [`LICENSE`](LICENSE) pour le texte complet.
 
 ## 🧑‍💻 Auteur
 
-**Christophe**  
+**Christophe Fauchère (alias Genysix)**  
 Chef de projet informatique passionné par le trading algorithmique, la data et la performance.
 
 ---
