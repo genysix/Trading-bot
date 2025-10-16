@@ -61,19 +61,26 @@ pip install -r requirements.txt
 
 ## 🔑 Configuration
 
-Les paramètres globaux (risque, levier, univers d’actifs, etc.) se trouvent dans :
-```
-config/config.py
-config/univers.py
-```
+### 🔧 Fichier d'environnement (`.env`)
 
-Les clefs API (OANDA) doivent être définies dans vos **variables d’environnement** :
+Le projet utilise un fichier **`.env`** pour stocker les variables sensibles (clé API OANDA, identifiant de compte, etc.).  
+Ce fichier **n’est pas versionné** pour des raisons de sécurité (il est listé dans `.gitignore`).  
+
+Un modèle est fourni sous le nom **`env.example`** — copiez-le et remplissez vos propres valeurs :
+
 ```bash
-export OANDA_API_KEY="ta_clef_api"
-export OANDA_ACCOUNT_ID="ton_compte_demo"
+cp env.example .env
 ```
 
-*(Ne jamais les inscrire en clair dans le code.)*
+Ensuite, éditez le fichier `.env` avec vos informations :
+```bash
+OANDA_API_KEY=ta_clé_personnelle
+OANDA_ACCOUNT_ID=ton_numéro_de_compte
+OANDA_ENV=practice
+```
+
+⚠️ **Ne jamais pousser** le fichier `.env` sur GitHub.  
+Il contient des informations confidentielles et spécifiques à ton environnement local.
 
 ---
 
