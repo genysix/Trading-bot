@@ -1,0 +1,19 @@
+# Environnements virtuels
+.venv/
+__pycache__/
+*.pyc
+
+# Données locales
+/data/*.csv
+/data/*.parquet
+
+# Fichiers de logs ou temporaires
+*.log
+*.tmp
+
+# Configurations locales
+.env
+.DS_Store
+
+# Les scripts GitHub
+updateGit.sh
