@@ -19,6 +19,3 @@ data_local/
 
 # Configurations locales
 .DS_Store
-
-# Les scripts GitHub
-updateGit.sh
